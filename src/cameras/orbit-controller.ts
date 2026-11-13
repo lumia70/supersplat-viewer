@@ -13,7 +13,7 @@ class OrbitController implements CameraController {
     constructor() {
         this.controller = new OrbitControllerPC();
         this.controller.zoomRange = new Vec2(0.01, Infinity);
-        this.controller.pitchRange = new Vec2(-90, 90);
+        this.controller.pitchRange = new Vec2(-Infinity, Infinity);
         this.controller.rotateDamping = DEFAULT_CONTROLLER_DAMPING;
         this.controller.moveDamping = DEFAULT_CONTROLLER_DAMPING;
         this.controller.zoomDamping = DEFAULT_CONTROLLER_DAMPING;

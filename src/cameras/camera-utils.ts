@@ -27,7 +27,7 @@ const rotation = new Quat();
  * @param maxPitch - Maximum pitch angle in degrees.
  * @returns The mutated angles.
  */
-const applyFrameRotation = (angles: Vec3, rotate: readonly number[], minPitch = -90, maxPitch = 90) => {
+const applyFrameRotation = (angles: Vec3, rotate: readonly number[], minPitch = -Infinity, maxPitch = Infinity) => {
     angles.x -= rotate[1];
     angles.y -= rotate[0];
     angles.z = 0;
