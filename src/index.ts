@@ -11,13 +11,14 @@ import {
     revision as engineRevision,
     version as engineVersion
 } from 'playcanvas';
-import type { Texture, TextureHandler, AppBase } from 'playcanvas';
+import type { Texture, TextureHandler, AppBase, GSplatHandler } from 'playcanvas';
 
 import { App } from './app';
 import { MeshCollision, loadVoxelCollision } from './collision';
 import type { Collision } from './collision';
 import { observe } from './core/observe';
 import { loadGsaf } from './gsaf/gsaf-player';
+import { GSplatGlbParser } from './gsplat-glb-parser';
 import { initLocalization } from './localization';
 import type { CreateViewerOptions } from './options';
 import { persistPreferences, readPreferences } from './preferences';
@@ -87,6 +88,31 @@ const loadGsplat = async (
         ? await (await contents).arrayBuffer()
         : contents) as unknown as ArrayBuffer;
 
+    // LCC2 is +Z up, spz and glTF are +Y up, and SOG/PLY are -Y up. An LOD manifest takes its
+    // orientation from the chunks it references; UWA GLB manifests can declare `-y` explicitly
+    // because the EGSC payload keeps the source (SOG-like) frame.
+    let upAxis: 'y' | '-y' = (name.endsWith('.spz') || name.endsWith('.glb')) ? 'y' : '-y';
+    if (name === 'lod-meta.json') {
+        try {
+            const manifest = await (await fetch(contentUrl)).json();
+            const firstFile = String(manifest?.filenames?.[0] ?? '').toLowerCase();
+            const declared = String(manifest?.upAxis ?? '').toLowerCase();
+            if (declared === 'y' || declared === 'positive') {
+                upAxis = 'y';
+            } else if (declared === '-y' || declared === 'negy') {
+                upAxis = '-y';
+            } else {
+                upAxis = firstFile.endsWith('.glb') ? 'y' : '-y';
+            }
+        } catch {
+            upAxis = '-y';
+        }
+    }
+    const upOverride = new URLSearchParams(location.search).get('upAxis');
+    if (upOverride === 'y' || upOverride === '-y') {
+        upAxis = upOverride;
+    }
+
     // Reading that metadata or those bytes spans a network round trip, so a destroy can land in
     // the middle of it. `app.destroy()` nulls the asset registry, so registering the asset now
     // would throw from the engine's internals; reject instead, which the viewer's load chains
@@ -102,10 +128,9 @@ const loadGsplat = async (
             // always name the app: the engine's default is the most recently created one,
             // which is another viewer's when two share a page
             const entity = new Entity('gsplat', app);
-            // LCC2 scenes are stored +Z up, spz files +Y up, the other formats -Y up
             if (name.endsWith('.lcc2')) {
                 entity.setLocalEulerAngles(270, 0, 0);
-            } else if (!name.endsWith('.spz')) {
+            } else if (upAxis === '-y') {
                 entity.setLocalEulerAngles(0, 0, 180);
             }
             entity.addComponent('gsplat', {
@@ -396,6 +421,10 @@ const createViewer = async (options: CreateViewerOptions): Promise<ViewerHandle>
     resizeCanvas(canvas, measureCanvas(canvas), resolutionScaleFor(preferences.quality, stochastic));
 
     const { app, camera, renderer } = await createApp(canvas, config);
+
+    // glTF scenes using KHR_gaussian_splatting (including LOD chunks) load through the gsplat
+    // handler, so register a parser for their .glb extension before any content is fetched.
+    (app.loader.getHandler('gsplat') as GSplatHandler).addParser(new GSplatGlbParser(app));
 
     // translate the markup and get this instance's string lookup, before the ui reads any
     const localize = initLocalization(config.lang, root);
