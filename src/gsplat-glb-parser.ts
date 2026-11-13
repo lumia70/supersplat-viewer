@@ -41,6 +41,7 @@ const SH_C0 = 0.28209479177387814;
 // original GLB, extracts the UWA_gaussian_splatting_compression_EGSC bufferView and returns CPU
 // arrays (positions, scales, rotations, RGBA colors and coefficient-major SH).
 const UWA_DECODER_URL = '/uwa/SplatDecoderBootstrap.worker.js';
+const UWA_PACK_WORKER_URL = '/uwa/uwa-pack.worker.js';
 const UWA_PROTOCOL_VERSION = 2;
 const UWA_BUILD_VERSION = 20260909;
 
@@ -383,13 +384,181 @@ const createUwaGSplatData = (decoded: any) => {
     return data;
 };
 
-const decodeUwaGlbAttempt = (buffer: ArrayBuffer, textureStrategies: string[]) => new Promise<GSplatData>((resolve, reject) => {
+type PackedUwa = {
+    color: Uint16Array;
+    transformA: Uint32Array;
+    transformB: Uint16Array;
+    sh: Record<string, Uint32Array>;
+};
+
+const packedMap = new WeakMap<object, PackedUwa>();
+
+// The engine packs GSplatData into GPU streams on the main thread. For UWA data we pre-pack the
+// same streams in a worker and let the resource constructor just copy them into its textures.
+const installUwaFastPath = () => {
+    const proto = GSplatResource.prototype as any;
+    if (proto.__uwaPackedFastPath) {
+        return;
+    }
+
+    const updateColorData = proto.updateColorData;
+    const updateTransformData = proto.updateTransformData;
+    const updateSHData = proto.updateSHData;
+
+    proto.updateColorData = function (gsplatData: any) {
+        const packed = packedMap.get(gsplatData);
+        if (packed) {
+            const texture = this.streams.getTexture('splatColor');
+            if (texture) {
+                const data = texture.lock();
+                data.set(packed.color);
+                texture.unlock();
+            }
+            return;
+        }
+        return updateColorData.call(this, gsplatData);
+    };
+
+    proto.updateTransformData = function (gsplatData: any) {
+        const packed = packedMap.get(gsplatData);
+        if (packed) {
+            const transformA = this.streams.getTexture('transformA');
+            const transformB = this.streams.getTexture('transformB');
+            if (transformA) {
+                const dataA = transformA.lock();
+                dataA.set(packed.transformA);
+                transformA.unlock();
+            }
+            if (transformB) {
+                const dataB = transformB.lock();
+                dataB.set(packed.transformB);
+                transformB.unlock();
+            }
+            return;
+        }
+        return updateTransformData.call(this, gsplatData);
+    };
+
+    proto.updateSHData = function (gsplatData: any) {
+        const packed = packedMap.get(gsplatData);
+        if (packed) {
+            for (const [name, values] of Object.entries(packed.sh)) {
+                const texture = this.streams.getTexture(name);
+                if (texture) {
+                    const data = texture.lock();
+                    data.set(values);
+                    texture.unlock();
+                }
+            }
+            return;
+        }
+        return updateSHData.call(this, gsplatData);
+    };
+
+    proto.__uwaPackedFastPath = true;
+};
+
+installUwaFastPath();
+
+const packUwaData = (decoded: any) => new Promise<{ data: GSplatData; packed: PackedUwa }>((resolve, reject) => {
+    const worker = new Worker(UWA_PACK_WORKER_URL, { type: 'module' });
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout>;
+
+    const finish = (err: Error | null, result?: { data: GSplatData; packed: PackedUwa }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        worker.terminate();
+        if (err) {
+            reject(err);
+        } else {
+            resolve(result!);
+        }
+    };
+
+    timeout = setTimeout(() => finish(new Error('UWA pack timed out')), 180000);
+
+    worker.onmessage = (event) => {
+        const message = event.data;
+        if (!message) {
+            return;
+        }
+        if (message.error) {
+            finish(new Error(message.error));
+            return;
+        }
+
+        try {
+            const count = decoded.numPoints as number;
+            const positions = message.positions as Float32Array;
+            const scales = message.scales as Float32Array;
+            const properties: any[] = [];
+            const addProp = (name: string, storage: Float32Array) => {
+                properties.push({ type: 'float', name, storage, byteSize: 4 });
+            };
+
+            addProp('x', extractComponent(positions, 3, 0, count));
+            addProp('y', extractComponent(positions, 3, 1, count));
+            addProp('z', extractComponent(positions, 3, 2, count));
+            addProp('scale_0', extractComponent(scales, 3, 0, count));
+            addProp('scale_1', extractComponent(scales, 3, 1, count));
+            addProp('scale_2', extractComponent(scales, 3, 2, count));
+
+            const data = new GSplatData([{
+                name: 'vertex',
+                count,
+                properties
+            }]);
+            Object.defineProperty(data, 'shBands', {
+                value: message.shBands,
+                configurable: true
+            });
+            data.activated = true;
+            packedMap.set(data, message.packed);
+            finish(null, { data, packed: message.packed });
+        } catch (e) {
+            finish(e as Error);
+        }
+    };
+
+    worker.onerror = (event) => {
+        finish(new Error(`UWA pack worker failed: ${event.message}`));
+    };
+
+    const transferList: Transferable[] = [];
+    const seen = new Set<ArrayBuffer>();
+    const transfer = (value: any) => {
+        const buffer = value?.buffer;
+        if (buffer && !seen.has(buffer)) {
+            seen.add(buffer);
+            transferList.push(buffer);
+        }
+    };
+    transfer(decoded.positions);
+    transfer(decoded.scales);
+    transfer(decoded.rotations);
+    transfer(decoded.colors);
+    transfer(decoded.featuresRestChannelMajor);
+
+    worker.postMessage({
+        numPoints: decoded.numPoints,
+        positions: decoded.positions,
+        scales: decoded.scales,
+        rotations: decoded.rotations,
+        colors: decoded.colors,
+        featuresRestChannelMajor: decoded.featuresRestChannelMajor,
+        shDegree: decoded.shDegree
+    }, transferList);
+});
+
+const decodeUwaGlbAttempt = (buffer: ArrayBuffer, textureStrategies: string[]) => new Promise<any>((resolve, reject) => {
     const decodeStarted = PERF ? performance.now() : 0;
     const worker = new Worker(UWA_DECODER_URL, { type: 'module' });
     let settled = false;
     let timeout: ReturnType<typeof setTimeout>;
 
-    const finish = (err: Error | null, data?: GSplatData) => {
+    const finish = (err: Error | null, data?: any) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
@@ -413,16 +582,10 @@ const decodeUwaGlbAttempt = (buffer: ArrayBuffer, textureStrategies: string[]) =
             return;
         }
 
-        try {
-            const mapStarted = PERF ? performance.now() : 0;
-            const data = createUwaGSplatData(message.data);
-            if (PERF) {
-                console.log('[GLB perf] decode=' + (mapStarted - decodeStarted).toFixed(0) + 'ms map=' + (performance.now() - mapStarted).toFixed(1) + 'ms points=' + data.numSplats + ' sh=' + data.shBands);
-            }
-            finish(null, data);
-        } catch (e) {
-            finish(e as Error);
+        if (PERF) {
+            console.log('[GLB perf] decode=' + (performance.now() - decodeStarted).toFixed(0) + 'ms points=' + message.data.numPoints + ' sh=' + message.data.shDegree);
         }
+        finish(null, message.data);
     };
 
     worker.onerror = (event) => {
@@ -448,7 +611,7 @@ const decodeUwaGlbAttempt = (buffer: ArrayBuffer, textureStrategies: string[]) =
     });
 });
 
-const decodeUwaGlb = async (buffer: ArrayBuffer) => {
+const decodeUwaGlb = async (buffer: ArrayBuffer): Promise<any> => {
     try {
         return await decodeUwaGlbAttempt(buffer, ['cpu']);
     } catch (e) {
@@ -488,7 +651,23 @@ class GSplatGlbParser {
                 const { json } = parseGlb(result);
                 if (isUwaGlb(json)) {
                     decodeUwaGlb(result)
-                    .then((data) => {
+                    .then(async (decoded) => {
+                        const legacy = new URLSearchParams(location.search).has('legacy');
+                        let data;
+                        if (legacy) {
+                            const mapStarted = PERF ? performance.now() : 0;
+                            data = createUwaGSplatData(decoded);
+                            if (PERF) {
+                                console.log('[GLB perf] legacy map=' + (performance.now() - mapStarted).toFixed(1) + 'ms');
+                            }
+                        } else {
+                            const packStarted = PERF ? performance.now() : 0;
+                            data = (await packUwaData(decoded)).data;
+                            if (PERF) {
+                                console.log('[GLB perf] pack=' + (performance.now() - packStarted).toFixed(1) + 'ms');
+                            }
+                        }
+
                         scheduleResourceJob(() => {
                             const buildStarted = PERF ? performance.now() : 0;
                             try {
@@ -523,6 +702,8 @@ class GSplatGlbParser {
 }
 
 export { GSplatGlbParser };
+
+
 
 
 
