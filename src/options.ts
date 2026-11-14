@@ -110,6 +110,8 @@ type ViewerFlags = {
     variant?: string;
     /** Splat budget in millions, overriding the Quality slider's ladder (every position then gives it). */
     budget?: number;
+    /** Camera fly/walk movement speed in m/s. Defaults to a value scaled by the scene bounds. */
+    moveSpeed?: number;
     /**
      * Developer knob: while the viewer renders on demand, the most rendered frames the gpu may
      * have unfinished before the next continuous render (the camera moving, the stochastic

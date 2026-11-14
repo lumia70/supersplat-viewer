@@ -616,6 +616,16 @@ class Viewer {
             events.fire('picker:ready', this.picker);
             this.inputController = new InputController(global, this.picker);
 
+            // Fly/walk speed defaults to 4 m/s, which is unusable in a kilometre-scale drone
+            // capture. Scale it with the scene and allow an explicit moveSpeed override.
+            const sceneExtent = sceneBound.halfExtents.length();
+            const autoMoveSpeed = Number.isFinite(sceneExtent) ?
+                Math.min(200, Math.max(4, sceneExtent / 20)) : 4;
+            const requestedMoveSpeed = config.moveSpeed;
+            this.inputController.setMoveSpeed(
+                Number.isFinite(requestedMoveSpeed) && requestedMoveSpeed! > 0 ? requestedMoveSpeed! : autoMoveSpeed
+            );
+
             this.cameraManager = new CameraManager(global, sceneBound, null, !sequence);
             applyCamera(this.cameraManager.camera);
 

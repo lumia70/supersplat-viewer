@@ -22,6 +22,12 @@ import type { Global } from './types';
 class InputController {
     moveSpeed = 4;
 
+    setMoveSpeed(speed: number) {
+        this.moveSpeed = speed;
+        this._keyboardMouse.moveSpeed = speed;
+        this._gamepad.moveSpeed = speed;
+    }
+
     frame = new InputFrame({
         move: [0, 0, 0],
         rotate: [0, 0, 0]

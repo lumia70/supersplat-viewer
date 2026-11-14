@@ -371,6 +371,7 @@ const resolveConfig = (options: CreateViewerOptions): Config => ({
         ? `taa:off,cull:off,${options.variant ?? ''}`
         : (options.variant ?? ''),
     budget: options.budget,
+    moveSpeed: options.moveSpeed,
     framesInFlight: options.framesInFlight ?? 2,
     heatmap: options.heatmap ?? false,
     debug: options.debug ?? false,
