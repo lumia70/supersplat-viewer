@@ -102,7 +102,7 @@ const loadGsplat = async (
             } else if (declared === '-y' || declared === 'negy') {
                 upAxis = '-y';
             } else {
-                upAxis = firstFile.endsWith('.glb') ? 'y' : '-y';
+                upAxis = /\.glb(?:[?#]|$)/i.test(firstFile) ? 'y' : '-y';
             }
         } catch {
             upAxis = '-y';

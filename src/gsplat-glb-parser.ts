@@ -12,9 +12,12 @@ const resourceJobs: (() => void)[] = [];
 let resourceJobScheduled = false;
 
 const runResourceJobs = () => {
-    const job = resourceJobs.shift();
-    if (job) {
+    const start = performance.now();
+    let processed = 0;
+    while (resourceJobs.length > 0 && processed < 64 && performance.now() - start < 8) {
+        const job = resourceJobs.shift()!;
         job();
+        ++processed;
     }
     if (resourceJobs.length > 0) {
         requestAnimationFrame(runResourceJobs);
@@ -460,97 +463,191 @@ const installUwaFastPath = () => {
 
 installUwaFastPath();
 
-const packUwaData = (decoded: any) => new Promise<{ data: GSplatData; packed: PackedUwa }>((resolve, reject) => {
-    const worker = new Worker(UWA_PACK_WORKER_URL, { type: 'module' });
-    let settled = false;
-    let timeout: ReturnType<typeof setTimeout>;
+type Range = { start: number; count: number };
 
-    const finish = (err: Error | null, result?: { data: GSplatData; packed: PackedUwa }) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        worker.terminate();
-        if (err) {
-            reject(err);
-        } else {
-            resolve(result!);
+const stripQuery = (url: string) => url.split(/[?#]/)[0];
+
+const parseRange = (url: string): Range | null => {
+    try {
+        const value = new URL(url, location.href).searchParams.get('range');
+        if (!value) {
+            return null;
         }
-    };
-
-    timeout = setTimeout(() => finish(new Error('UWA pack timed out')), 180000);
-
-    worker.onmessage = (event) => {
-        const message = event.data;
-        if (!message) {
-            return;
+        const [start, count] = value.split(',').map(Number);
+        if (!Number.isFinite(start) || !Number.isFinite(count) || start < 0 || count <= 0) {
+            return null;
         }
-        if (message.error) {
-            finish(new Error(message.error));
-            return;
-        }
+        return { start, count };
+    } catch {
+        return null;
+    }
+};
 
-        try {
-            const count = decoded.numPoints as number;
-            const positions = message.positions as Float32Array;
-            const scales = message.scales as Float32Array;
-            const properties: any[] = [];
-            const addProp = (name: string, storage: Float32Array) => {
-                properties.push({ type: 'float', name, storage, byteSize: 4 });
-            };
+// One pack worker services all files/ranges; range tiles create many small pack requests.
+let packWorker: Worker | null = null;
+let packCurrent: { resolve: (value: any) => void; reject: (error: Error) => void } | null = null;
+const packQueue: Array<{
+    payload: any;
+    transfer: Transferable[];
+    resolve: (value: any) => void;
+    reject: (error: Error) => void;
+}> = [];
 
-            addProp('x', extractComponent(positions, 3, 0, count));
-            addProp('y', extractComponent(positions, 3, 1, count));
-            addProp('z', extractComponent(positions, 3, 2, count));
-            addProp('scale_0', extractComponent(scales, 3, 0, count));
-            addProp('scale_1', extractComponent(scales, 3, 1, count));
-            addProp('scale_2', extractComponent(scales, 3, 2, count));
+const pumpPack = () => {
+    if (packCurrent || packQueue.length === 0) {
+        return;
+    }
+    const job = packQueue.shift()!;
+    packCurrent = { resolve: job.resolve, reject: job.reject };
+    if (!packWorker) {
+        packWorker = new Worker(UWA_PACK_WORKER_URL, { type: 'module' });
+        packWorker.onmessage = (event) => {
+            const current = packCurrent;
+            packCurrent = null;
+            if (!current) {
+                return;
+            }
+            if (event.data?.error) {
+                current.reject(new Error(event.data.error));
+            } else {
+                current.resolve(event.data);
+            }
+            pumpPack();
+        };
+        packWorker.onerror = (event) => {
+            const current = packCurrent;
+            packCurrent = null;
+            if (current) {
+                current.reject(new Error(`UWA pack worker failed: ${event.message}`));
+            }
+            packWorker?.terminate();
+            packWorker = null;
+            pumpPack();
+        };
+    }
+    packWorker.postMessage(job.payload, job.transfer);
+};
 
-            const data = new GSplatData([{
-                name: 'vertex',
-                count,
-                properties
-            }]);
-            Object.defineProperty(data, 'shBands', {
-                value: message.shBands,
-                configurable: true
-            });
-            data.activated = true;
-            packedMap.set(data, message.packed);
-            finish(null, { data, packed: message.packed });
-        } catch (e) {
-            finish(e as Error);
-        }
-    };
-
-    worker.onerror = (event) => {
-        finish(new Error(`UWA pack worker failed: ${event.message}`));
-    };
-
-    const transferList: Transferable[] = [];
-    const seen = new Set<ArrayBuffer>();
-    const transfer = (value: any) => {
-        const buffer = value?.buffer;
-        if (buffer && !seen.has(buffer)) {
-            seen.add(buffer);
-            transferList.push(buffer);
-        }
-    };
-    transfer(decoded.positions);
-    transfer(decoded.scales);
-    transfer(decoded.rotations);
-    transfer(decoded.colors);
-    transfer(decoded.featuresRestChannelMajor);
-
-    worker.postMessage({
-        numPoints: decoded.numPoints,
-        positions: decoded.positions,
-        scales: decoded.scales,
-        rotations: decoded.rotations,
-        colors: decoded.colors,
-        featuresRestChannelMajor: decoded.featuresRestChannelMajor,
-        shDegree: decoded.shDegree
-    }, transferList);
+const enqueuePack = (payload: any, transfer: Transferable[]) => new Promise<any>((resolve, reject) => {
+    packQueue.push({ payload, transfer, resolve, reject });
+    pumpPack();
 });
+
+const buildPackedRange = async (decoded: any, start: number, count: number) => {
+    const fullCount = decoded.numPoints as number;
+    if (start < 0 || count <= 0 || start + count > fullCount) {
+        throw new Error(`UWA range out of bounds: start=${start} count=${count} points=${fullCount}`);
+    }
+
+    const shDegree = (decoded.shDegree ?? 0) as number;
+    const numCoeffs = SH_BAND_COEF_COUNTS[shDegree] ?? 0;
+    const positions = decoded.positions.slice(start * 3, (start + count) * 3);
+    const scales = decoded.scales.slice(start * 3, (start + count) * 3);
+    const rotations = decoded.rotations.slice(start * 4, (start + count) * 4);
+    const colors = decoded.colors.slice(start * 4, (start + count) * 4);
+
+    const fullFeatures = decoded.featuresRestChannelMajor as Float32Array | null;
+    let features: Float32Array | null = null;
+    if (numCoeffs > 0 && fullFeatures && fullFeatures.length >= fullCount * numCoeffs * 3) {
+        features = new Float32Array(count * numCoeffs * 3);
+        for (let k = 0; k < numCoeffs * 3; ++k) {
+            features.set(fullFeatures.subarray(k * fullCount + start, k * fullCount + start + count), k * count);
+        }
+    }
+
+    const transfer: Transferable[] = [
+        positions.buffer,
+        scales.buffer,
+        rotations.buffer,
+        colors.buffer
+    ];
+    if (features) {
+        transfer.push(features.buffer);
+    }
+
+    const message = await enqueuePack({
+        numPoints: count,
+        positions,
+        scales,
+        rotations,
+        colors,
+        featuresRestChannelMajor: features,
+        shDegree
+    }, transfer);
+
+    const properties: any[] = [];
+    const addProp = (name: string, storage: Float32Array) => {
+        properties.push({ type: 'float', name, storage, byteSize: 4 });
+    };
+    addProp('x', extractComponent(message.positions, 3, 0, count));
+    addProp('y', extractComponent(message.positions, 3, 1, count));
+    addProp('z', extractComponent(message.positions, 3, 2, count));
+    addProp('scale_0', extractComponent(message.scales, 3, 0, count));
+    addProp('scale_1', extractComponent(message.scales, 3, 1, count));
+    addProp('scale_2', extractComponent(message.scales, 3, 2, count));
+
+    const data = new GSplatData([{
+        name: 'vertex',
+        count,
+        properties
+    }]);
+    Object.defineProperty(data, 'shBands', {
+        value: message.shBands,
+        configurable: true
+    });
+    data.activated = true;
+    packedMap.set(data, message.packed);
+    return data;
+};
+
+const packUwaData = (decoded: any) => buildPackedRange(decoded, 0, decoded.numPoints);
+
+// Full decoded files are shared by every range tile in that file. Keep a small LRU so a
+// camera move across a handful of source tiles reuses the decode instead of repeating it.
+const MAX_DECODED_UWA = 8;
+const decodedCache = new Map<string, Promise<any>>();
+
+const getDecodedUwa = (baseUrl: string) => {
+    const cached = decodedCache.get(baseUrl);
+    if (cached) {
+        decodedCache.delete(baseUrl);
+        decodedCache.set(baseUrl, cached);
+        return cached;
+    }
+
+    const promise = new Promise<any>((resolve, reject) => {
+        Asset.fetchArrayBuffer(baseUrl, (err, result) => {
+            if (err) {
+                reject(new Error(err));
+                return;
+            }
+            try {
+                const { json } = parseGlb(result);
+                if (!isUwaGlb(json)) {
+                    reject(new Error('range GLB is not UWA compressed'));
+                    return;
+                }
+                decodeUwaGlb(result).then(resolve, reject);
+            } catch (e) {
+                reject(e as Error);
+            }
+        }, undefined, 0);
+    });
+
+    decodedCache.set(baseUrl, promise);
+    if (decodedCache.size > MAX_DECODED_UWA) {
+        const oldest = decodedCache.keys().next().value;
+        if (oldest && oldest !== baseUrl) {
+            decodedCache.delete(oldest);
+        }
+    }
+    promise.catch(() => {
+        if (decodedCache.get(baseUrl) === promise) {
+            decodedCache.delete(baseUrl);
+        }
+    });
+    return promise;
+};
 
 const decodeUwaGlbAttempt = (buffer: ArrayBuffer, textureStrategies: string[]) => new Promise<any>((resolve, reject) => {
     const decodeStarted = PERF ? performance.now() : 0;
@@ -635,10 +732,30 @@ class GSplatGlbParser {
     }
 
     canParse(context: ParserContext) {
-        return context.ext === 'glb';
+        return context.ext === 'glb' || /\.glb(?:[?#]|$)/i.test(context.url ?? '');
     }
 
     load(url: ParserUrl, callback: ParserCallback, asset?: Asset) {
+        const range = parseRange(url.load);
+        if (range) {
+            const prepareCenters = (this._app.scene as any).gsplatCentersEnabled !== false;
+            getDecodedUwa(stripQuery(url.load))
+            .then(decoded => buildPackedRange(decoded, range.start, range.count))
+            .then((data) => {
+                scheduleResourceJob(() => {
+                    try {
+                        callback(null, new GSplatResource(this._app.graphicsDevice, data, { prepareCenters }));
+                    } catch (e) {
+                        callback((e as Error).message);
+                    }
+                });
+            })
+            .catch((e: Error) => {
+                callback(e.message);
+            });
+            return;
+        }
+
         Asset.fetchArrayBuffer(url.load, (err, result) => {
             if (err) {
                 callback(err);
@@ -662,7 +779,7 @@ class GSplatGlbParser {
                             }
                         } else {
                             const packStarted = PERF ? performance.now() : 0;
-                            data = (await packUwaData(decoded)).data;
+                            data = await packUwaData(decoded);
                             if (PERF) {
                                 console.log('[GLB perf] pack=' + (performance.now() - packStarted).toFixed(1) + 'ms');
                             }
@@ -702,22 +819,3 @@ class GSplatGlbParser {
 }
 
 export { GSplatGlbParser };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
